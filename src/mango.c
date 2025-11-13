@@ -70,6 +70,7 @@
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_switch.h>
+#include <wlr/types/wlr_touch.h>
 #include <wlr/types/wlr_viewporter.h>
 #include <wlr/types/wlr_virtual_keyboard_v1.h>
 #include <wlr/types/wlr_virtual_pointer_v1.h>
@@ -526,6 +527,11 @@ static void pinch_update(struct wl_listener *listener, void *data);
 static void pinch_end(struct wl_listener *listener, void *data);
 static void hold_begin(struct wl_listener *listener, void *data);
 static void hold_end(struct wl_listener *listener, void *data);
+static void touchdown(struct wl_listener *listener, void *data);
+static void touchmotion(struct wl_listener *listener, void *data);
+static void touchup(struct wl_listener *listener, void *data);
+static void touchframe(struct wl_listener *listener, void *data);
+static void touchcancel(struct wl_listener *listener, void *data);
 static void checkidleinhibitor(struct wlr_surface *exclude);
 static void cleanup(void);										  // 退出清理
 static void cleanupmon(struct wl_listener *listener, void *data); // 退出清理
@@ -544,8 +550,10 @@ static void createlocksurface(struct wl_listener *listener, void *data);
 static void createmon(struct wl_listener *listener, void *data);
 static void createnotify(struct wl_listener *listener, void *data);
 static void createpointer(struct wlr_pointer *pointer);
+static void createtouch(struct wlr_input_device *pointer);
 static void configure_pointer(struct libinput_device *device);
 static void destroyinputdevice(struct wl_listener *listener, void *data);
+static void destroytouch(struct wl_listener *listener, void *data);
 static void createswitch(struct wlr_switch *switch_device);
 static void switch_toggle(struct wl_listener *listener, void *data);
 static void createpointerconstraint(struct wl_listener *listener, void *data);
@@ -778,6 +786,7 @@ static struct wlr_drm_lease_v1_manager *drm_lease_manager;
 static struct wlr_cursor *cursor;
 static struct wlr_xcursor_manager *cursor_mgr;
 static struct wlr_session *session;
+static struct wlr_touch *touch;
 
 static struct wlr_scene_rect *root_bg;
 static struct wlr_session_lock_manager_v1 *session_lock_mgr;
@@ -871,6 +880,12 @@ static struct wl_listener output_mgr_apply = {.notify = outputmgrapply};
 static struct wl_listener output_mgr_test = {.notify = outputmgrtest};
 static struct wl_listener output_power_mgr_set_mode = {.notify =
 														   powermgrsetmode};
+static struct wl_listener touch_device_destroy = {.notify = destroytouch};
+static struct wl_listener touch_down = {.notify = touchdown};
+static struct wl_listener touch_motion = {.notify = touchmotion};
+static struct wl_listener touch_up = {.notify = touchup};
+static struct wl_listener touch_frame = {.notify = touchframe};
+static struct wl_listener touch_cancel = {.notify = touchcancel};
 static struct wl_listener request_activate = {.notify = urgent};
 static struct wl_listener request_cursor = {.notify = setcursor};
 static struct wl_listener request_set_psel = {.notify = setpsel};
@@ -1771,6 +1786,63 @@ void hold_end(struct wl_listener *listener, void *data) {
 										  event->time_msec, event->cancelled);
 }
 
+void touchdown(struct wl_listener *listener, void *data) {
+	struct wlr_touch_down_event *event = data;
+	double lx, ly, sx, sy;
+	struct wlr_surface *surface;
+
+	// TODO: binding to output
+	wlr_cursor_absolute_to_layout_coords(cursor, &event->touch->base, event->x,
+									  event->y, &lx, &ly);
+	xytonode(lx, ly, &surface, NULL, NULL, &sx, &sy);
+
+	if (!surface)
+		return;
+
+	wlr_seat_touch_notify_down(seat, surface, event->time_msec,
+						 event->touch_id, sx, sy);
+}
+
+void touchmotion(struct wl_listener* listener, void *data) {
+	struct wlr_touch_motion_event *event = data;
+	struct wlr_touch_point* p = wlr_seat_touch_get_point(seat,
+													  event->touch_id);
+	double lx, ly, sx, sy;
+	struct Client* client;
+
+	if (!p->surface) // might be destroyed
+		return;
+
+	// TODO: binding to output
+	wlr_cursor_absolute_to_layout_coords(cursor, &event->touch->base, event->x,
+									  event->y, &lx, &ly);
+	client = p->surface->data;
+	// TODO: how to deal with animations?
+	sx = lx - client->current.x;
+	sy = ly - client->current.y;
+
+	wlr_seat_touch_notify_motion(seat, event->time_msec, event->touch_id, sx,
+							  sy);
+}
+
+void touchup(struct wl_listener* listener, void *data) {
+	struct wlr_touch_up_event *event = data;
+	wlr_seat_touch_notify_up(seat, event->time_msec, event->touch_id);
+}
+
+void touchframe(struct wl_listener* listener, void *data) {
+	wlr_seat_touch_notify_frame(seat);
+}
+
+void touchcancel(struct wl_listener* listener, void *data) {
+	struct wlr_touch_cancel_event *event = data;
+	struct wlr_touch_point* p = wlr_seat_touch_get_point(seat,
+													  event->touch_id);
+
+	wlr_seat_touch_notify_cancel(seat, p->client);
+}
+
+
 void place_drag_tile_client(Client *c) {
 	Client *tc = NULL;
 	Client *closest_client = NULL;
@@ -2438,6 +2510,22 @@ void createkeyboard(struct wlr_keyboard *keyboard) {
 
 	/* Add the new keyboard to the group */
 	wlr_keyboard_group_add_keyboard(kb_group->wlr_group, keyboard);
+}
+
+void createtouch(struct wlr_input_device *device) {
+	if (!touch) {
+		touch = wlr_touch_from_input_device(device);
+		wl_signal_add(&device->events.destroy, &touch_device_destroy);
+		wlr_cursor_attach_input_device(cursor, device);
+	} else if (device == &touch->base) {
+		wlr_log(WLR_ERROR, "createtouch: duplicate device");
+	} else {
+		wlr_log(WLR_ERROR, "createtouch: already have on touch device");
+	}
+}
+
+void destroytouch(struct wl_listener *listener, void *data) {
+	touch = NULL;
 }
 
 KeyboardGroup *createkeyboardgroup(void) {
@@ -3263,6 +3351,9 @@ void inputdevice(struct wl_listener *listener, void *data) {
 	case WLR_INPUT_DEVICE_SWITCH:
 		createswitch(wlr_switch_from_input_device(device));
 		break;
+	case WLR_INPUT_DEVICE_TOUCH:
+		createtouch(device);
+		break;
 	default:
 		/* TODO handle other input device types */
 		break;
@@ -3276,7 +3367,10 @@ void inputdevice(struct wl_listener *listener, void *data) {
 	caps = WL_SEAT_CAPABILITY_POINTER;
 	if (!wl_list_empty(&kb_group->wlr_group->devices))
 		caps |= WL_SEAT_CAPABILITY_KEYBOARD;
+	if (touch)
+		caps |= WL_SEAT_CAPABILITY_TOUCH;
 	wlr_seat_set_capabilities(seat, caps);
+	wlr_log(WLR_ERROR, "TOUCH caps is %d", caps & WL_SEAT_CAPABILITY_TOUCH);
 }
 
 int keyrepeat(void *data) {
@@ -5041,6 +5135,11 @@ void setup(void) {
 	wl_signal_add(&cursor->events.button, &cursor_button);
 	wl_signal_add(&cursor->events.axis, &cursor_axis);
 	wl_signal_add(&cursor->events.frame, &cursor_frame);
+	wl_signal_add(&cursor->events.touch_down, &touch_down);
+	wl_signal_add(&cursor->events.touch_motion, &touch_motion);
+	wl_signal_add(&cursor->events.touch_up, &touch_up);
+	wl_signal_add(&cursor->events.touch_frame, &touch_frame);
+	wl_signal_add(&cursor->events.touch_cancel, &touch_cancel);
 
 	// 这两句代码会造成obs窗口里的鼠标光标消失,不知道注释有什么影响
 	cursor_shape_mgr = wlr_cursor_shape_manager_v1_create(dpy, 1);
