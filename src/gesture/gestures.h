@@ -90,8 +90,8 @@ typedef struct TouchEvent {
 	double x, y;
 } TouchEvent;
 
-static Finger *find_finger(int id);
-static int find_finger_index(int id);
+static Finger *find_finger(GestureDetectors *self, int id);
+static int find_finger_index(GestureDetectors *self, int id);
 static void origin_center(const GestureState *state, int32_t *x, int32_t *y);
 
 static enum GesturePhase multifinger_detector_update(MultiFingerDetector *self,
@@ -154,8 +154,6 @@ static enum GesturePhase multifinger_detector_update(MultiFingerDetector *self,
 	}
 }
 
-GestureDetectors *gesture_detectors;
-
 static void gesture_state_init(GestureState *state) {
 	for (int i = 0; i < GESTURE_MAX_FINGERS; i++) {
 		state->fingers[i] = (Finger){.id = -1};
@@ -164,7 +162,6 @@ static void gesture_state_init(GestureState *state) {
 
 // Returns null if out-of-space
 static Finger *gesture_state_add_finger(GestureState *state, Finger finger) {
-	assert(!find_finger(finger.id));
 	if (state->fingers_count >= GESTURE_MAX_FINGERS) {
 		return false;
 	}
@@ -180,8 +177,9 @@ static Finger *gesture_state_add_finger(GestureState *state, Finger finger) {
 }
 
 // Returns whether or not the finger was found
-static bool gesture_state_remove_finger(GestureState *state, int id) {
-	int i = find_finger_index(id);
+static bool gesture_state_remove_finger(GestureDetectors *self,
+										GestureState *state, int id) {
+	int i = find_finger_index(self, id);
 	if (i < 0)
 		return false;
 	*state->fingers = (Finger){.id = -1};
@@ -203,19 +201,19 @@ static bool gesture_phase_ends_drag(enum GesturePhase phase) {
 		   phase == GESTURE_PHASE_CANCEL;
 }
 
-GestureEvent gesture_detectors_touchdown(uint32_t time_msec, uint32_t id,
+GestureEvent gesture_detectors_touchdown(GestureDetectors *self,
+										 uint32_t time_msec, uint32_t id,
 										 double x, double y) {
-	GestureState *state = &gesture_detectors->state;
+	GestureState *state = &self->state;
 
 	if (state->fingers_count == 0) {
 		state->start_time = time_msec;
-		gesture_detectors->drag_ended = false;
-		gesture_detectors->active = GESTURE_KIND_NONE;
+		self->drag_ended = false;
+		self->active = GESTURE_KIND_NONE;
 	}
 
-	if (gesture_detectors->drag_ended) {
-		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE,
-							  gesture_detectors->active};
+	if (self->drag_ended) {
+		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE, self->active};
 	}
 
 	Finger finger = {
@@ -225,6 +223,7 @@ GestureEvent gesture_detectors_touchdown(uint32_t time_msec, uint32_t id,
 		.current_x = x,
 		.current_y = y,
 	};
+	assert(!find_finger(self, finger.id));
 	gesture_state_add_finger(state, finger);
 
 	enum GesturePhase phase;
@@ -235,21 +234,19 @@ GestureEvent gesture_detectors_touchdown(uint32_t time_msec, uint32_t id,
 		.x = x,
 		.y = y,
 	};
-	switch (gesture_detectors->active) {
+	switch (self->active) {
 	case GESTURE_KIND_NONE:
-		phase = multifinger_detector_update(&gesture_detectors->swipe, state,
-											&touch);
+		phase = multifinger_detector_update(&self->swipe, state, &touch);
 		if (phase == GESTURE_PHASE_DRAG_BEGIN) {
-			gesture_detectors->active = GESTURE_KIND_SWIPE;
+			self->active = GESTURE_KIND_SWIPE;
 			kind = GESTURE_KIND_SWIPE;
 			break;
 		}
 
 	case GESTURE_KIND_SWIPE:
-		phase = multifinger_detector_update(&gesture_detectors->swipe, state,
-											&touch);
+		phase = multifinger_detector_update(&self->swipe, state, &touch);
 		if (gesture_phase_ends_drag(phase)) {
-			gesture_detectors->drag_ended = true;
+			self->drag_ended = true;
 		}
 		break;
 	}
@@ -260,15 +257,16 @@ GestureEvent gesture_detectors_touchdown(uint32_t time_msec, uint32_t id,
 	};
 }
 
-GestureEvent gesture_detectors_touchmove(uint32_t time_msec, uint32_t id,
+GestureEvent gesture_detectors_touchmove(GestureDetectors *self,
+										 uint32_t time_msec, uint32_t id,
 										 double x, double y) {
-	if (gesture_detectors->drag_ended) {
+	if (self->drag_ended) {
 		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE, GESTURE_KIND_NONE};
 	}
 
-	GestureState *state = &gesture_detectors->state;
+	GestureState *state = &self->state;
 
-	Finger *finger = find_finger(id);
+	Finger *finger = find_finger(self, id);
 	if (finger) {
 		finger->current_x = x;
 		finger->current_y = y;
@@ -280,7 +278,7 @@ GestureEvent gesture_detectors_touchmove(uint32_t time_msec, uint32_t id,
 		.x = x,
 		.y = y,
 	};
-	switch (gesture_detectors->active) {
+	switch (self->active) {
 	case GESTURE_KIND_NONE: {
 		TouchEvent ev = {
 			.time = time_msec,
@@ -290,34 +288,35 @@ GestureEvent gesture_detectors_touchmove(uint32_t time_msec, uint32_t id,
 			.y = y,
 		};
 		enum GesturePhase phase =
-			multifinger_detector_update(&gesture_detectors->swipe, state, &ev);
+			multifinger_detector_update(&self->swipe, state, &ev);
 		if (phase == GESTURE_PHASE_DRAG_BEGIN) {
-			assert(gesture_detectors->swipe.detected_type != GESTURE_KIND_NONE);
-			gesture_detectors->active = gesture_detectors->swipe.detected_type;
-			return (GestureEvent){phase, gesture_detectors->active};
+			assert(self->swipe.detected_type != GESTURE_KIND_NONE);
+			self->active = self->swipe.detected_type;
+			return (GestureEvent){phase, self->active};
 		}
 	}
 	case GESTURE_KIND_SWIPE: {
-		enum GesturePhase phase = multifinger_detector_update(
-			&gesture_detectors->swipe, state, &touch);
+		enum GesturePhase phase =
+			multifinger_detector_update(&self->swipe, state, &touch);
 		if (gesture_phase_ends_drag(phase)) {
-			gesture_detectors->drag_ended = true;
+			self->drag_ended = true;
 		}
 		return (GestureEvent){phase, GESTURE_KIND_SWIPE};
 	}
 	}
 }
 
-GestureEvent gesture_detectors_touchup(uint32_t time_msec, uint32_t id) {
-	if (gesture_detectors->drag_ended) {
+GestureEvent gesture_detectors_touchup(GestureDetectors *self,
+									   uint32_t time_msec, uint32_t id) {
+	if (self->drag_ended) {
 		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE, GESTURE_KIND_NONE};
 	}
 
-	GestureState *state = &gesture_detectors->state;
+	GestureState *state = &self->state;
 
 	double x, y;
 	{
-		Finger *finger = find_finger(id);
+		Finger *finger = find_finger(self, id);
 		if (!finger) {
 			return (GestureEvent){GESTURE_PHASE_ALREADY_DONE,
 								  GESTURE_KIND_NONE};
@@ -326,7 +325,7 @@ GestureEvent gesture_detectors_touchup(uint32_t time_msec, uint32_t id) {
 		y = finger->current_y;
 	}
 
-	gesture_state_remove_finger(state, id);
+	gesture_state_remove_finger(self, state, id);
 
 	TouchEvent touch = {
 		.time = time_msec,
@@ -335,25 +334,24 @@ GestureEvent gesture_detectors_touchup(uint32_t time_msec, uint32_t id) {
 		.x = x,
 		.y = y,
 	};
-	switch (gesture_detectors->active) {
+	switch (self->active) {
 	case GESTURE_KIND_NONE: {
-		enum GesturePhase phase = multifinger_detector_update(
-			&gesture_detectors->swipe, state, &touch);
+		enum GesturePhase phase =
+			multifinger_detector_update(&self->swipe, state, &touch);
 		if (phase == GESTURE_PHASE_DRAG_BEGIN) {
-			assert(gesture_detectors->swipe.detected_type != GESTURE_KIND_NONE);
-			gesture_detectors->active = gesture_detectors->swipe.detected_type;
-			return (GestureEvent){phase, gesture_detectors->active};
+			assert(self->swipe.detected_type != GESTURE_KIND_NONE);
+			self->active = self->swipe.detected_type;
+			return (GestureEvent){phase, self->active};
 		}
 	}
 	case GESTURE_KIND_SWIPE: {
-		assert(gesture_detectors->active ==
-			   gesture_detectors->swipe.detected_type);
-		enum GesturePhase phase = multifinger_detector_update(
-			&gesture_detectors->swipe, state, &touch);
+		assert(self->active == self->swipe.detected_type);
+		enum GesturePhase phase =
+			multifinger_detector_update(&self->swipe, state, &touch);
 		if (gesture_phase_ends_drag(phase)) {
-			gesture_detectors->drag_ended = true;
+			self->drag_ended = true;
 		}
-		return (GestureEvent){phase, gesture_detectors->active};
+		return (GestureEvent){phase, self->active};
 	}
 	}
 }
@@ -377,16 +375,16 @@ static void origin_center(const GestureState *state, int32_t *x, int32_t *y) {
 	*y = sum_y / state->fingers_count;
 }
 
-static Finger *find_finger(int id) {
-	int i = find_finger_index(id);
+static Finger *find_finger(GestureDetectors *self, int id) {
+	int i = find_finger_index(self, id);
 	if (i < 0)
 		return NULL;
-	return &gesture_detectors->state.fingers[i];
+	return &self->state.fingers[i];
 }
 
-static int find_finger_index(int id) {
+static int find_finger_index(GestureDetectors *self, int id) {
 	for (int i = 0; i < GESTURE_MAX_FINGERS; i++) {
-		if (gesture_detectors->state.fingers[i].id == id) {
+		if (self->state.fingers[i].id == id) {
 			return i;
 		}
 	}
