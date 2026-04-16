@@ -94,6 +94,7 @@
 #include <xcb/xcb_icccm.h>
 #endif
 #include "common/util.h"
+#include "gesture/core.h"
 
 /* macros */
 #define MAX(A, B) ((A) > (B) ? (A) : (B))
