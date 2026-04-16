@@ -8,39 +8,35 @@
 // in mm
 #define SWIPE_SLOP 0.2
 
-//    +--> DETECTING
-//    |
-//    +----------------+--> DRAG_CANCEL
-//    |                |
-// ---+--> DRAG_BEGIN -+--> DRAG_FLING
-//    |                |
-//    +----------------+--> END
-// TODO: split into phases and a new GestureEventType
-// - BEGIN, END, CANCEL and FLING should be GestureEventType
-// - GesturePhase should also add a CANCELLED and ENDED, which replaces
-// ALREADY_DONE
+//                 (DETECTING)
+//                     |
+//         /-----------+--------+--CANCEL--> (CANCELLED)
+//         |                    |
+//     DRAG_BEGIN              END
+//         |                    |
+//         v                    v
+// (DRAG_IN_PROGRESS)        (ENDED)
+//         |                    ^
+//         |                    |
+//         +--- END/FLING ------/
+//         |
+//      CANCEL
+//         |
+//         v
+//    (CANCELLED)
 enum GesturePhase {
-	// No gesture detected so far
 	GESTURE_PHASE_DETECTING,
+	GESTURE_PHASE_DRAG_IN_PROGRESS,
+	GESTURE_PHASE_CANCELLED,
+	GESTURE_PHASE_ENDED,
+};
 
-	// The gesture is cancelled. When triggered during a drag, the drag is ended
-	GESTURE_PHASE_CANCEL,
-
-	// A gesture is detected and enters the drag phase. Some gestures (i.e. tap)
-	// do not emit this event and skip straight to GESTURE_PHASE_END
-	GESTURE_PHASE_DRAG_BEGIN,
-
-	GESTURE_PHASE_DRAG_IN_PROGRESS, // TODO: I should split phases from gesture
-									// event kinds
-
-	// A fling is detected. This ends the drag gesture, if any.
-	GESTURE_PHASE_DRAG_FLING,
-
-	// The drag ended, or a gesture without a drag phase is triggered.
-	GESTURE_PHASE_END,
-
-	// The gesture already ended/cancelled/flung
-	GESTURE_PHASE_ALREADY_DONE,
+enum GestureEventType {
+	GESTURE_EVENT_BEGIN,
+	GESTURE_EVENT_CANCEL,
+	GESTURE_EVENT_FLING,
+	GESTURE_EVENT_END,
+	GESTURE_EVENT_NONE,
 };
 
 enum GestureKind {
@@ -50,6 +46,7 @@ enum GestureKind {
 
 typedef struct GestureEvent {
 	enum GesturePhase phase;
+	enum GestureEventType event;
 	enum GestureKind kind;
 } GestureEvent;
 
@@ -94,18 +91,22 @@ static Finger *find_finger(GestureDetectors *self, int id);
 static int find_finger_index(GestureDetectors *self, int id);
 static void origin_center(const GestureState *state, int32_t *x, int32_t *y);
 
-static enum GesturePhase multifinger_detector_update(MultiFingerDetector *self,
-													 const GestureState *state,
-													 const TouchEvent *ev) {
+static enum GestureEventType
+multifinger_detector_update(MultiFingerDetector *self,
+							const GestureState *state, const TouchEvent *ev) {
 	int32_t origin_x, origin_y;
 	const double swipe_slop_2 = SWIPE_SLOP * SWIPE_SLOP;
 
 	origin_center(state, &origin_x, &origin_y);
 	switch (state->phase) {
+	case GESTURE_PHASE_CANCELLED:
+	case GESTURE_PHASE_ENDED:
+		return GESTURE_EVENT_NONE;
+
 	case GESTURE_PHASE_DETECTING:
 		switch (ev->type) {
 		case TOUCH_UP:
-			return GESTURE_PHASE_CANCEL;
+			return GESTURE_EVENT_CANCEL;
 		case TOUCH_MOVE: {
 			double delta_x = origin_x - ev->x;
 			double delta_y = origin_y - ev->y;
@@ -113,45 +114,34 @@ static enum GesturePhase multifinger_detector_update(MultiFingerDetector *self,
 
 			if (swipe_slop_2 <= distance) {
 				self->detected_type = GESTURE_KIND_SWIPE;
-				return GESTURE_PHASE_DRAG_BEGIN;
+				return GESTURE_EVENT_BEGIN;
 			} else {
-				return GESTURE_PHASE_DETECTING;
+				return GESTURE_EVENT_NONE;
 			}
 		}
 		case TOUCH_DOWN:
-			return GESTURE_PHASE_DETECTING;
+			return GESTURE_EVENT_NONE;
 		}
-		break;
-
-	case GESTURE_PHASE_ALREADY_DONE:
-		return GESTURE_PHASE_ALREADY_DONE;
+		return GESTURE_EVENT_NONE;
 
 	case GESTURE_PHASE_DRAG_IN_PROGRESS:
 		switch (self->detected_type) {
 		case GESTURE_KIND_NONE:
-			assert(false); // TODO
+			return GESTURE_EVENT_CANCEL;
 		case GESTURE_KIND_SWIPE:
 			switch (ev->type) {
 			case TOUCH_UP:
-				return state->fingers_count == 0
-						   ? GESTURE_PHASE_END
-						   : GESTURE_PHASE_DRAG_IN_PROGRESS;
+				return state->fingers_count == 0 ? GESTURE_EVENT_END
+												 : GESTURE_EVENT_NONE;
 			case TOUCH_MOVE:
-				return GESTURE_PHASE_DRAG_IN_PROGRESS;
+				return GESTURE_EVENT_NONE;
 			case TOUCH_DOWN:
-				return GESTURE_PHASE_CANCEL;
+				return GESTURE_EVENT_CANCEL;
 			}
 		}
-		return GESTURE_PHASE_DETECTING;
-
-	default:
-		assert(false);
-		// the rest are "events" rather than phases
-		// case GESTURE_PHASE_DRAG_BEGIN:
-		// case GESTURE_PHASE_CANCEL:
-		// case GESTURE_PHASE_DRAG_FLING:
-		// case GESTURE_PHASE_END:
+		return GESTURE_EVENT_NONE;
 	}
+	return GESTURE_EVENT_NONE;
 }
 
 static void gesture_state_init(GestureState *state) {
@@ -196,9 +186,9 @@ void gesture_detectors_init(GestureDetectors *d) {
 	d->monitor_h_mm = 0;
 }
 
-static bool gesture_phase_ends_drag(enum GesturePhase phase) {
-	return phase == GESTURE_PHASE_END || phase == GESTURE_PHASE_DRAG_FLING ||
-		   phase == GESTURE_PHASE_CANCEL;
+static bool gesture_event_ends_drag(enum GestureEventType event) {
+	return event == GESTURE_EVENT_END || event == GESTURE_EVENT_FLING ||
+		   event == GESTURE_EVENT_CANCEL;
 }
 
 GestureEvent gesture_detectors_touchdown(GestureDetectors *self,
@@ -208,12 +198,13 @@ GestureEvent gesture_detectors_touchdown(GestureDetectors *self,
 
 	if (state->fingers_count == 0) {
 		state->start_time = time_msec;
+		state->phase = GESTURE_PHASE_DETECTING;
 		self->drag_ended = false;
 		self->active = GESTURE_KIND_NONE;
 	}
 
 	if (self->drag_ended) {
-		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE, self->active};
+		return (GestureEvent){state->phase, GESTURE_EVENT_NONE, self->active};
 	}
 
 	Finger finger = {
@@ -226,8 +217,8 @@ GestureEvent gesture_detectors_touchdown(GestureDetectors *self,
 	assert(!find_finger(self, finger.id));
 	gesture_state_add_finger(state, finger);
 
-	enum GesturePhase phase;
-	enum GestureKind kind = 0; // TODO
+	enum GestureEventType event;
+	enum GestureKind kind = GESTURE_KIND_NONE;
 	TouchEvent touch = {
 		.time = time_msec,
 		.finger_id = id,
@@ -236,23 +227,26 @@ GestureEvent gesture_detectors_touchdown(GestureDetectors *self,
 	};
 	switch (self->active) {
 	case GESTURE_KIND_NONE:
-		phase = multifinger_detector_update(&self->swipe, state, &touch);
-		if (phase == GESTURE_PHASE_DRAG_BEGIN) {
+		event = multifinger_detector_update(&self->swipe, state, &touch);
+		if (event == GESTURE_EVENT_BEGIN) {
 			self->active = GESTURE_KIND_SWIPE;
+			state->phase = GESTURE_PHASE_DRAG_IN_PROGRESS;
 			kind = GESTURE_KIND_SWIPE;
 			break;
 		}
 
 	case GESTURE_KIND_SWIPE:
-		phase = multifinger_detector_update(&self->swipe, state, &touch);
-		if (gesture_phase_ends_drag(phase)) {
+		event = multifinger_detector_update(&self->swipe, state, &touch);
+		if (gesture_event_ends_drag(event)) {
 			self->drag_ended = true;
+			state->phase = GESTURE_PHASE_ENDED;
 		}
 		break;
 	}
 
 	return (GestureEvent){
-		.phase = phase,
+		.phase = state->phase,
+		.event = event,
 		.kind = kind,
 	};
 }
@@ -261,7 +255,8 @@ GestureEvent gesture_detectors_touchmove(GestureDetectors *self,
 										 uint32_t time_msec, uint32_t id,
 										 double x, double y) {
 	if (self->drag_ended) {
-		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE, GESTURE_KIND_NONE};
+		return (GestureEvent){self->state.phase, GESTURE_EVENT_NONE,
+							  GESTURE_KIND_NONE};
 	}
 
 	GestureState *state = &self->state;
@@ -287,29 +282,36 @@ GestureEvent gesture_detectors_touchmove(GestureDetectors *self,
 			.x = x,
 			.y = y,
 		};
-		enum GesturePhase phase =
+		enum GestureEventType event =
 			multifinger_detector_update(&self->swipe, state, &ev);
-		if (phase == GESTURE_PHASE_DRAG_BEGIN) {
+		if (event == GESTURE_EVENT_BEGIN) {
 			assert(self->swipe.detected_type != GESTURE_KIND_NONE);
 			self->active = self->swipe.detected_type;
-			return (GestureEvent){phase, self->active};
+			state->phase = GESTURE_PHASE_DRAG_IN_PROGRESS;
+			return (GestureEvent){state->phase, event, self->active};
 		}
+		return (GestureEvent){state->phase, GESTURE_EVENT_NONE,
+							  GESTURE_KIND_NONE};
 	}
 	case GESTURE_KIND_SWIPE: {
-		enum GesturePhase phase =
+		enum GestureEventType event =
 			multifinger_detector_update(&self->swipe, state, &touch);
-		if (gesture_phase_ends_drag(phase)) {
+		if (gesture_event_ends_drag(event)) {
 			self->drag_ended = true;
+			state->phase = GESTURE_PHASE_ENDED;
 		}
-		return (GestureEvent){phase, GESTURE_KIND_SWIPE};
+		return (GestureEvent){state->phase, event, GESTURE_KIND_SWIPE};
 	}
 	}
+	assert(false); // unreachable
+	return (GestureEvent){state->phase, GESTURE_EVENT_NONE, GESTURE_KIND_NONE};
 }
 
 GestureEvent gesture_detectors_touchup(GestureDetectors *self,
 									   uint32_t time_msec, uint32_t id) {
 	if (self->drag_ended) {
-		return (GestureEvent){GESTURE_PHASE_ALREADY_DONE, GESTURE_KIND_NONE};
+		return (GestureEvent){self->state.phase, GESTURE_EVENT_NONE,
+							  GESTURE_KIND_NONE};
 	}
 
 	GestureState *state = &self->state;
@@ -318,7 +320,7 @@ GestureEvent gesture_detectors_touchup(GestureDetectors *self,
 	{
 		Finger *finger = find_finger(self, id);
 		if (!finger) {
-			return (GestureEvent){GESTURE_PHASE_ALREADY_DONE,
+			return (GestureEvent){state->phase, GESTURE_EVENT_NONE,
 								  GESTURE_KIND_NONE};
 		}
 		x = finger->current_x;
@@ -336,24 +338,30 @@ GestureEvent gesture_detectors_touchup(GestureDetectors *self,
 	};
 	switch (self->active) {
 	case GESTURE_KIND_NONE: {
-		enum GesturePhase phase =
+		enum GestureEventType event =
 			multifinger_detector_update(&self->swipe, state, &touch);
-		if (phase == GESTURE_PHASE_DRAG_BEGIN) {
+		if (event == GESTURE_EVENT_BEGIN) {
 			assert(self->swipe.detected_type != GESTURE_KIND_NONE);
 			self->active = self->swipe.detected_type;
-			return (GestureEvent){phase, self->active};
+			state->phase = GESTURE_PHASE_DRAG_IN_PROGRESS;
+			return (GestureEvent){state->phase, event, self->active};
 		}
+		return (GestureEvent){state->phase, GESTURE_EVENT_NONE,
+							  GESTURE_KIND_NONE};
 	}
 	case GESTURE_KIND_SWIPE: {
 		assert(self->active == self->swipe.detected_type);
-		enum GesturePhase phase =
+		enum GestureEventType event =
 			multifinger_detector_update(&self->swipe, state, &touch);
-		if (gesture_phase_ends_drag(phase)) {
+		if (gesture_event_ends_drag(event)) {
 			self->drag_ended = true;
+			state->phase = GESTURE_PHASE_ENDED;
 		}
-		return (GestureEvent){phase, self->active};
+		return (GestureEvent){state->phase, event, self->active};
 	}
 	}
+	assert(false); // unreachable
+	return (GestureEvent){state->phase, GESTURE_EVENT_NONE, GESTURE_KIND_NONE};
 }
 
 static void origin_center(const GestureState *state, int32_t *x, int32_t *y) {
