@@ -1,6 +1,7 @@
 /*
  * See LICENSE file for copyright and license details.
  */
+#include "wayland-util.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "wlr/util/box.h"
 #include "wlr/util/edges.h"
@@ -463,6 +464,7 @@ typedef struct TouchGroup {
 	struct wl_list link;
 	struct wlr_touch *touch;
 	struct wl_list touch_points;
+	GestureDetectors gestures;
 	Monitor *m;
 } TouchGroup;
 
@@ -3381,6 +3383,7 @@ void createtouch(struct wlr_touch *wlr_touch) {
 	TouchGroup *touch = ecalloc(1, sizeof(TouchGroup));
 
 	touch->touch = wlr_touch;
+	gesture_detectors_init(&touch->gestures);
 	wl_list_init(&touch->touch_points);
 	wl_list_insert(&touch_groups, &touch->link);
 	wlr_touch->data = touch;
@@ -5937,6 +5940,9 @@ void touchdown(struct wl_listener *listener, void *data) {
 									   m->wlr_output);
 	}
 
+	gestures_on_touch_down(&tg->gestures, event, m->wlr_output->phys_width,
+						   m->wlr_output->phys_height);
+
 	wlr_cursor_absolute_to_layout_coords(cursor, &event->touch->base, event->x,
 										 event->y, &lx, &ly);
 
@@ -5986,9 +5992,14 @@ void touchup(struct wl_listener *listener, void *data) {
 		}
 	}
 	if (!t) // invalid or cancelled
+	{
+		gestures_on_touch_up(&tg->gestures, event);
 		return;
+	}
 	wl_list_remove(&t->link);
 	free(t);
+
+	gestures_on_touch_up(&tg->gestures, event);
 
 	if (emulating_pointer_from_touch) {
 		if (emulated_pointer_touch_id == event->touch_id) {
@@ -6041,6 +6052,8 @@ void touchmotion(struct wl_listener *listener, void *data) {
 	}
 	if (!t) // invalid or cancelled
 		return;
+
+	gestures_on_touch_move(&tg->gestures, event);
 
 	wlr_cursor_absolute_to_layout_coords(cursor, &event->touch->base, event->x,
 										 event->y, &lx, &ly);

@@ -79,6 +79,8 @@ typedef struct GestureDetectors {
 
 	enum GestureKind active;
 	bool drag_ended;
+
+	double monitor_w_mm, monitor_h_mm;
 } GestureDetectors;
 
 typedef struct TouchEvent {
@@ -190,6 +192,10 @@ static bool gesture_state_remove_finger(GestureState *state, int id) {
 void gesture_detectors_init(GestureDetectors *d) {
 	d->swipe = (MultiFingerDetector){0};
 	gesture_state_init(&d->state);
+	d->active = GESTURE_KIND_NONE;
+	d->drag_ended = false;
+	d->monitor_w_mm = 0;
+	d->monitor_h_mm = 0;
 }
 
 static bool gesture_phase_ends_drag(enum GesturePhase phase) {
