@@ -157,7 +157,7 @@ static Finger *gesture_state_add_finger(GestureState *state, Finger finger) {
 	}
 
 	for (int i = 0; i < GESTURE_MAX_FINGERS; i++) {
-		if (state->fingers[i].id != -1) {
+		if (state->fingers[i].id == -1) {
 			state->fingers[i] = finger;
 			return &state->fingers[i];
 		}
@@ -255,6 +255,7 @@ GestureEvent gesture_detectors_touchmove(GestureDetectors *self,
 										 uint32_t time_msec, uint32_t id,
 										 double x, double y) {
 	if (self->drag_ended) {
+		// TODO: this skip makes state inconsistent with reality, is that ok?
 		return (GestureEvent){self->state.phase, GESTURE_EVENT_NONE,
 							  GESTURE_KIND_NONE};
 	}
@@ -309,13 +310,7 @@ GestureEvent gesture_detectors_touchmove(GestureDetectors *self,
 
 GestureEvent gesture_detectors_touchup(GestureDetectors *self,
 									   uint32_t time_msec, uint32_t id) {
-	if (self->drag_ended) {
-		return (GestureEvent){self->state.phase, GESTURE_EVENT_NONE,
-							  GESTURE_KIND_NONE};
-	}
-
 	GestureState *state = &self->state;
-
 	double x, y;
 	{
 		Finger *finger = find_finger(self, id);
@@ -328,6 +323,11 @@ GestureEvent gesture_detectors_touchup(GestureDetectors *self,
 	}
 
 	gesture_state_remove_finger(self, state, id);
+
+	if (self->drag_ended) {
+		return (GestureEvent){self->state.phase, GESTURE_EVENT_NONE,
+							  GESTURE_KIND_NONE};
+	}
 
 	TouchEvent touch = {
 		.time = time_msec,
